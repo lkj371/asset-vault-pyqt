@@ -42,20 +42,20 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     background: #ffffff;
     border-bottom: 1px solid #e2e8f0;
     padding: 0 32px;
-    min-height: 60px;
-    max-height: 60px;
+    min-height: 52px;
+    max-height: 52px;
 }
 
 #headerLogo {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
         stop:0 #6366f1, stop:1 #8b5cf6);
-    border-radius: 10px;
+    border-radius: 8px;
     color: white;
-    font-size: 18px;
-    min-width: 36px;
-    max-width: 36px;
-    min-height: 36px;
-    max-height: 36px;
+    font-size: 16px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
 }
 
 #headerTitle {
@@ -63,11 +63,6 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     font-weight: 700;
     color: #0f172a;
     letter-spacing: -0.3px;
-}
-
-#headerSubtitle {
-    font-size: 11px;
-    color: #94a3b8;
 }
 
 #headerBadge {
@@ -84,6 +79,10 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     border-right: 1px solid #e2e8f0;
     min-width: 240px;
     max-width: 240px;
+}
+
+#sidebarFilterWidget {
+    background: transparent;
 }
 
 #sidebarSectionTitle {
@@ -429,24 +428,6 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     font-size: 16px;
     font-weight: 700;
     color: #0f172a;
-}
-
-#modalCloseBtn {
-    background: #f1f5f9;
-    border: none;
-    border-radius: 6px;
-    min-width: 28px;
-    max-width: 28px;
-    min-height: 28px;
-    max-height: 28px;
-    font-size: 14px;
-    color: #64748b;
-    font-family: inherit;
-}
-
-#modalCloseBtn:hover {
-    background: #e2e8f0;
-    color: #475569;
 }
 
 #modalBody {

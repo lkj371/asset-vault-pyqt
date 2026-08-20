@@ -2,7 +2,6 @@
 离线运行，AES-256-GCM 加密，SQLite 本地存储
 """
 import sys
-import os
 from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication
@@ -22,17 +21,21 @@ def get_icon_path():
 
 
 def get_data_dir():
-    """获取数据存储目录"""
-    if sys.platform == "win32":
-        base = os.environ.get("APPDATA", Path.home() / "AppData/Roaming")
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library/Application Support"
-    else:
-        base = Path.home() / ".config"
-    return Path(base) / "com.assetvault.app"
+    """获取数据存储目录：与程序同目录，便于维护与备份
+
+    - PyInstaller 打包后：vault.db 存放在 .exe 所在目录
+    - 源码运行：vault.db 存放在 main.py 所在目录
+    """
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包环境：exe 所在目录
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def main():
+    # 高分屏支持（必须在 QApplication 创建之前调用，否则不生效）
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+
     app = QApplication(sys.argv)
     app.setApplicationName("AssetVault")
     app.setApplicationVersion("2.0.0")
@@ -48,9 +51,6 @@ def main():
     font.setFamilies(["Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", "sans-serif"])
     font.setPointSize(10)
     app.setFont(font)
-
-    # 启用高分屏支持
-    app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     data_dir = get_data_dir()
     db_path = data_dir / "vault.db"

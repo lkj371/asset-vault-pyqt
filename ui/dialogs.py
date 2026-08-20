@@ -11,24 +11,34 @@ from PyQt6.QtGui import QColor, QPalette
 from models import Asset
 from utils import (
     format_now, check_password_strength, calculate_status,
-    mask_serial, STATUS_CONFIG, TYPE_CONFIG
+    mask_serial, STATUS_CONFIG, TYPE_CONFIG, get_type_config
+)
+from templates import (
+    FIELD_TEXT, FIELD_PASSWORD, FIELD_TEXTAREA, FIELD_DATE,
+    FIELD_SELECT, FIELD_NUMBER, FIELD_FILE, FIELD_TYPE_LABELS,
+    LEGACY_TYPES, get_template, ordered_templates, resolve_column,
 )
 
 
 class AssetDialog(QDialog):
     saved = pyqtSignal(object)
 
-    def __init__(self, parent=None, mode="add", asset_type="serial", asset=None):
+    def __init__(self, parent=None, mode="add", asset_type="serial", asset=None, custom_templates=None):
         super().__init__(parent)
         self.mode = mode
         self.current_type = asset_type
         self.asset = asset
+        self.custom_templates = custom_templates or []
+        self.dynamic_widgets = {}   # 模板字段 key -> (字段定义, 控件)
         self.setWindowTitle("新增资产" if mode == "add" else "编辑资产")
         self.setMinimumWidth(500)
         self.setMaximumHeight(800)
         self.setup_ui()
         if asset:
             self.load_data()
+
+    def template(self):
+        return get_template(self.current_type, self.custom_templates)
 
     def setup_ui(self):
         from ui.style import MAIN_STYLE
@@ -44,20 +54,16 @@ class AssetDialog(QDialog):
         hlayout.setContentsMargins(20, 16, 20, 16)
 
         title_layout = QHBoxLayout()
-        icon = QLabel(TYPE_CONFIG[self.current_type]["icon"])
+        tpl = self.template()
+        icon = QLabel(tpl["icon"])
         icon.setStyleSheet("font-size: 20px;")
         title_layout.addWidget(icon)
-        self.title_label = QLabel(f"{'新增' if self.mode == 'add' else '编辑'}{TYPE_CONFIG[self.current_type]['label']}")
+        self.title_label = QLabel(f"{'新增' if self.mode == 'add' else '编辑'}{tpl['label']}")
         self.title_label.setObjectName("modalTitle")
         title_layout.addWidget(self.title_label)
         title_layout.addStretch()
         hlayout.addLayout(title_layout)
 
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("modalCloseBtn")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.clicked.connect(self.reject)
-        hlayout.addWidget(close_btn)
         layout.addWidget(header)
 
         # 主体
@@ -67,28 +73,39 @@ class AssetDialog(QDialog):
         blayout.setContentsMargins(24, 20, 24, 20)
         blayout.setSpacing(16)
 
-        # 类型选择（仅新增模式）
+        # 类型选择（仅新增模式）：下拉列出全部内置 + 自定义模板
         if self.mode == "add":
             type_layout = QHBoxLayout()
             type_layout.setSpacing(8)
-            self.btn_serial = QPushButton("🔑 序列号")
-            self.btn_password = QPushButton("🛡️ 密码")
-            self.btn_serial.setObjectName("typeSelectorBtnActive" if self.current_type == "serial" else "typeSelectorBtn")
-            self.btn_password.setObjectName("typeSelectorBtnActive" if self.current_type == "password" else "typeSelectorBtn")
-            self.btn_serial.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_password.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_serial.clicked.connect(lambda: self.switch_type("serial"))
-            self.btn_password.clicked.connect(lambda: self.switch_type("password"))
-            type_layout.addWidget(self.btn_serial)
-            type_layout.addWidget(self.btn_password)
+            type_layout.addWidget(self._form_label("资产类型"))
+            self.type_combo = QComboBox()
+            self.type_combo.setObjectName("inputField")
+            self.type_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+            for tpl in ordered_templates(self.custom_templates):
+                self.type_combo.addItem(f"{tpl['icon']} {tpl['label']}", tpl["key"])
+            idx = self.type_combo.findData(self.current_type)
+            if idx >= 0:
+                self.type_combo.setCurrentIndex(idx)
+            self.type_combo.currentIndexChanged.connect(self.on_type_combo_changed)
+            type_layout.addWidget(self.type_combo, 1)
             blayout.addLayout(type_layout)
 
         # 名称
-        blayout.addWidget(self._form_label("软件名称" if self.current_type == "serial" else "服务名称", required=True))
+        self.name_label = self._form_label("名称", required=True)
+        blayout.addWidget(self.name_label)
         self.name_input = QLineEdit()
         self.name_input.setObjectName("inputField")
-        self.name_input.setPlaceholderText("如: JetBrains IntelliJ IDEA" if self.current_type == "serial" else "如: GitHub, 阿里云")
-        blayout.addWidget(self.name_input)
+        # 命名规范提示：与输入框组成独立小块（4px 间距），
+        # 不用负边距，避免被输入框遮挡或与下方标签交叠
+        name_hint = QLabel("💡 命名建议：产品/服务名 + 用途或环境，如「阿里云 OSS（生产环境）」")
+        name_hint.setObjectName("nameHint")
+        name_hint.setStyleSheet("font-size: 11px; color: #94a3b8; background: transparent;")
+        name_block = QVBoxLayout()
+        name_block.setContentsMargins(0, 0, 0, 0)
+        name_block.setSpacing(4)
+        name_block.addWidget(self.name_input)
+        name_block.addWidget(name_hint)
+        blayout.addLayout(name_block)
 
         # 序列号字段
         self.serial_fields = QWidget()
@@ -196,14 +213,27 @@ class AssetDialog(QDialog):
         pfl.addWidget(self.url_input)
         blayout.addWidget(self.password_fields)
 
-        # 通用字段
-        blayout.addWidget(self._form_label("绑定邮箱"))
+        # 动态模板字段容器（非旧版类型：按模板定义生成表单）
+        self.dynamic_container = QWidget()
+        self.dynamic_layout = QVBoxLayout(self.dynamic_container)
+        self.dynamic_layout.setContentsMargins(0, 0, 0, 0)
+        self.dynamic_layout.setSpacing(16)
+        blayout.addWidget(self.dynamic_container)
+
+        # 通用字段（仅旧版类型：序列号/密码）
+        self.legacy_common = QWidget()
+        lcl = QVBoxLayout(self.legacy_common)
+        lcl.setContentsMargins(0, 0, 0, 0)
+        lcl.setSpacing(16)
+
+        lcl.addWidget(self._form_label("绑定邮箱"))
         self.email_input = QLineEdit()
         self.email_input.setObjectName("inputField")
         self.email_input.setPlaceholderText("account@example.com")
-        blayout.addWidget(self.email_input)
+        lcl.addWidget(self.email_input)
 
-        blayout.addWidget(self._form_label("有效期至" if self.current_type == "serial" else "密码到期提醒"))
+        self.legacy_expire_label = self._form_label("有效期至")
+        lcl.addWidget(self.legacy_expire_label)
         self.expire_input = QDateEdit()
         self.expire_input.setObjectName("inputField")
         self.expire_input.setCalendarPopup(True)
@@ -211,7 +241,15 @@ class AssetDialog(QDialog):
         self.expire_input.setDisplayFormat("yyyy-MM-dd")
         self.expire_input.setSpecialValueText("  永久")
         self.expire_input.setDate(QDate(2000, 1, 1))
-        blayout.addWidget(self.expire_input)
+        lcl.addWidget(self.expire_input)
+        blayout.addWidget(self.legacy_common)
+
+        # 标签（全类型通用，供高级筛选组合查询）
+        blayout.addWidget(self._form_label("标签"))
+        self.tags_input = QLineEdit()
+        self.tags_input.setObjectName("inputField")
+        self.tags_input.setPlaceholderText("多个标签用逗号分隔，如: 工作, 生产环境")
+        blayout.addWidget(self.tags_input)
 
         blayout.addWidget(self._form_label("备注"))
         self.note_input = QTextEdit()
@@ -254,20 +292,195 @@ class AssetDialog(QDialog):
         label.setObjectName("formLabel")
         return label
 
+    def on_type_combo_changed(self, index):
+        key = self.type_combo.itemData(index)
+        if key and key != self.current_type:
+            self.switch_type(key)
+
     def switch_type(self, asset_type):
         self.current_type = asset_type
-        self.btn_serial.setObjectName("typeSelectorBtnActive" if asset_type == "serial" else "typeSelectorBtn")
-        self.btn_password.setObjectName("typeSelectorBtnActive" if asset_type == "password" else "typeSelectorBtn")
-        self.btn_serial.style().unpolish(self.btn_serial)
-        self.btn_serial.style().polish(self.btn_serial)
-        self.btn_password.style().unpolish(self.btn_password)
-        self.btn_password.style().polish(self.btn_password)
-        self.title_label.setText(f"{'新增' if self.mode == 'add' else '编辑'}{TYPE_CONFIG[asset_type]['label']}")
+        tpl = self.template()
+        self.title_label.setText(f"{'新增' if self.mode == 'add' else '编辑'}{tpl['label']}")
         self.update_fields_visibility()
 
     def update_fields_visibility(self):
+        tpl = self.template()
+        is_legacy = self.current_type in LEGACY_TYPES
         self.serial_fields.setVisible(self.current_type == "serial")
         self.password_fields.setVisible(self.current_type == "password")
+        self.legacy_common.setVisible(is_legacy)
+        self.dynamic_container.setVisible(not is_legacy)
+        # 名称标签与占位随模板变化
+        name_text = {"serial": "软件名称", "password": "服务名称"}.get(self.current_type, "名称")
+        self.name_label.setText(f"{name_text} <span style='color:#ef4444;'>*</span>")
+        self.name_input.setPlaceholderText(tpl.get("name_placeholder") or "")
+        if is_legacy:
+            self.legacy_expire_label.setText("有效期至" if self.current_type == "serial" else "密码到期提醒")
+        else:
+            self.build_dynamic_form()
+
+    # ===== 模板引擎动态表单 =====
+
+    def build_dynamic_form(self):
+        """按模板字段定义生成表单控件"""
+        # 清空旧控件
+        while self.dynamic_layout.count():
+            item = self.dynamic_layout.takeAt(0)
+                # 字段行内可能嵌套子布局（文件选择）
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            elif item.layout() is not None:
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget() is not None:
+                        sub.widget().deleteLater()
+        self.dynamic_widgets = {}
+
+        tpl = self.template()
+        old_extra = {}
+        if self.asset and self.asset.asset_type == self.current_type and self.asset.extra:
+            old_extra = self.asset.extra
+
+        for fdef in tpl.get("fields", []):
+            label = self._form_label(fdef["label"], required=fdef.get("required"))
+            self.dynamic_layout.addWidget(label)
+            widget = self._create_field_widget(fdef, old_extra.get(fdef["key"]))
+            if isinstance(widget, QWidget):
+                self.dynamic_layout.addWidget(widget)
+            else:  # 子布局（附件行）
+                self.dynamic_layout.addLayout(widget)
+            self.dynamic_widgets[fdef["key"]] = (fdef, widget)
+
+    def _create_field_widget(self, fdef, value=None):
+        """按字段类型创建控件，并回填旧值"""
+        ftype = fdef.get("type", FIELD_TEXT)
+        value = "" if value is None else str(value)
+
+        if ftype == FIELD_PASSWORD:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            inp = QLineEdit()
+            inp.setObjectName("inputField")
+            inp.setEchoMode(QLineEdit.EchoMode.Password)
+            inp.setPlaceholderText(fdef.get("placeholder") or "输入后加密存储")
+            inp.setText(value)
+            row.addWidget(inp)
+            eye = QPushButton("👁")
+            eye.setObjectName("btnSecondary")
+            eye.setCursor(Qt.CursorShape.PointingHandCursor)
+            eye.setCheckable(True)
+            eye.toggled.connect(
+                lambda checked, i=inp: i.setEchoMode(
+                    QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+                )
+            )
+            row.addWidget(eye)
+            row.setProperty("field_input", True)
+            # 用一个容器持有取值控件引用
+            holder = QWidget()
+            holder.setLayout(row)
+            holder.setProperty("value_widget", inp)
+            return holder
+
+        if ftype == FIELD_TEXTAREA:
+            inp = QTextEdit()
+            inp.setObjectName("textArea")
+            inp.setPlaceholderText(fdef.get("placeholder") or "")
+            inp.setMaximumHeight(70)
+            inp.setPlainText(value)
+            return inp
+
+        if ftype == FIELD_DATE:
+            inp = QDateEdit()
+            inp.setObjectName("inputField")
+            inp.setCalendarPopup(True)
+            inp.setDisplayFormat("yyyy-MM-dd")
+            inp.setSpecialValueText("  不设置")
+            inp.setMinimumDate(QDate(2000, 1, 1))
+            if value:
+                try:
+                    y, m, d = map(int, value.split("-"))
+                    inp.setDate(QDate(y, m, d))
+                except (ValueError, TypeError):
+                    inp.setDate(QDate(2000, 1, 1))
+            else:
+                inp.setDate(QDate(2000, 1, 1))
+            return inp
+
+        if ftype == FIELD_SELECT:
+            inp = QComboBox()
+            inp.setObjectName("inputField")
+            inp.setCursor(Qt.CursorShape.PointingHandCursor)
+            inp.addItem("请选择", "")
+            for opt in fdef.get("options", []):
+                inp.addItem(opt, opt)
+            if value:
+                idx = inp.findData(value)
+                if idx >= 0:
+                    inp.setCurrentIndex(idx)
+            return inp
+
+        if ftype == FIELD_NUMBER:
+            inp = QSpinBox()
+            inp.setObjectName("inputField")
+            inp.setRange(0, 999999)
+            try:
+                inp.setValue(int(value) if value else 0)
+            except ValueError:
+                inp.setValue(0)
+            return inp
+
+        if ftype == FIELD_FILE:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            inp = QLineEdit()
+            inp.setObjectName("inputField")
+            inp.setReadOnly(True)
+            inp.setPlaceholderText("点击浏览选择文件...")
+            inp.setText(value)
+            row.addWidget(inp)
+            browse = QPushButton("📂 浏览")
+            browse.setObjectName("btnSecondary")
+            browse.setCursor(Qt.CursorShape.PointingHandCursor)
+            browse.clicked.connect(lambda: self._browse_file(inp))
+            row.addWidget(browse)
+            holder = QWidget()
+            holder.setLayout(row)
+            holder.setProperty("value_widget", inp)
+            return holder
+
+        # 默认：单行文本
+        inp = QLineEdit()
+        inp.setObjectName("inputField")
+        inp.setPlaceholderText(fdef.get("placeholder") or "")
+        inp.setText(value)
+        return inp
+
+    def _browse_file(self, inp):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, "选择文件")
+        if path:
+            inp.setText(path)
+
+    def _field_value(self, fdef, widget) -> str:
+        """从控件提取字段值（空值返回空串）"""
+        # 文件/密码行是容器，真正的输入控件挂在属性上
+        val_widget = widget.property("value_widget")
+        if val_widget is not None:
+            widget = val_widget
+        ftype = fdef.get("type", FIELD_TEXT)
+        if isinstance(widget, QTextEdit):
+            return widget.toPlainText().strip()
+        if isinstance(widget, QDateEdit):
+            d = widget.date()
+            return "" if d.year() <= 2000 else d.toString("yyyy-MM-dd")
+        if isinstance(widget, QComboBox):
+            return widget.currentData() or ""
+        if isinstance(widget, QSpinBox):
+            v = widget.value()
+            return str(v) if v else ""
+        return widget.text().strip()
 
     def update_remain(self):
         self.remain_spin.setValue(max(0, self.total_spin.value() - self.used_spin.value()))
@@ -302,24 +515,26 @@ class AssetDialog(QDialog):
         if not self.asset:
             return
         self.name_input.setText(self.asset.name)
-        self.email_input.setText(self.asset.email or "")
         self.note_input.setText(self.asset.note or "")
-        if self.asset.expire:
-            try:
-                from PyQt6.QtCore import QDate
-                y, m, d = map(int, self.asset.expire.split("-"))
-                self.expire_input.setDate(QDate(y, m, d))
-            except:
-                pass
-        if self.asset.asset_type == "serial":
-            self.serial_input.setText(self.asset.account)
-            self.total_spin.setValue(self.asset.total or 1)
-            self.used_spin.setValue(self.asset.used or 0)
-            self.remain_spin.setValue(self.asset.remain or 0)
-        else:
-            self.username_input.setText(self.asset.account)
-            self.password_input.setText(self.asset.password or "")
-            self.url_input.setText(self.asset.url or "")
+        self.tags_input.setText(self.asset.tags or "")
+        if self.asset.asset_type in LEGACY_TYPES:
+            self.email_input.setText(self.asset.email or "")
+            if self.asset.expire:
+                try:
+                    y, m, d = map(int, self.asset.expire.split("-"))
+                    self.expire_input.setDate(QDate(y, m, d))
+                except (ValueError, TypeError):
+                    pass
+            if self.asset.asset_type == "serial":
+                self.serial_input.setText(self.asset.account)
+                self.total_spin.setValue(self.asset.total or 1)
+                self.used_spin.setValue(self.asset.used or 0)
+                self.remain_spin.setValue(self.asset.remain or 0)
+            else:
+                self.username_input.setText(self.asset.account)
+                self.password_input.setText(self.asset.password or "")
+                self.url_input.setText(self.asset.url or "")
+        # 动态模板字段的回填在 build_dynamic_form 中完成（setup_ui 尾部已触发）
 
     def save(self):
         if not self.name_input.text().strip():
@@ -334,26 +549,57 @@ class AssetDialog(QDialog):
             QMessageBox.warning(self, "提示", "用户名不能为空")
             return
 
-        expire_date = self.expire_input.date()
-        expire_str = expire_date.toString("yyyy-MM-dd") if expire_date.year() > 2000 else ""
+        tpl = self.template()
+        # 已归档为手动生命周期状态：编辑保存后保留，不被自动计算覆盖
+        kept_status = "archived" if (self.asset and self.asset.status == "archived") else "normal"
 
-        asset = Asset(
-            id=self.asset.id if self.asset else 0,
-            asset_type=self.current_type,
-            name=self.name_input.text().strip(),
-            account=self.serial_input.text().strip() if self.current_type == "serial" else self.username_input.text().strip(),
-            password=self.password_input.text() if self.current_type == "password" else None,
-            email=self.email_input.text().strip() or None,
-            total=self.total_spin.value() if self.current_type == "serial" else None,
-            used=self.used_spin.value() if self.current_type == "serial" else None,
-            remain=self.remain_spin.value() if self.current_type == "serial" else None,
-            expire=expire_str or None,
-            url=self.url_input.text().strip() or None if self.current_type == "password" else None,
-            status="normal",
-            note=self.note_input.toPlainText().strip() or None,
-            updated=format_now(),
-        )
-        asset.status = calculate_status(asset)
+        if self.current_type in LEGACY_TYPES:
+            expire_date = self.expire_input.date()
+            expire_str = expire_date.toString("yyyy-MM-dd") if expire_date.year() > 2000 else ""
+            asset = Asset(
+                id=self.asset.id if self.asset else 0,
+                asset_type=self.current_type,
+                name=self.name_input.text().strip(),
+                account=self.serial_input.text().strip() if self.current_type == "serial" else self.username_input.text().strip(),
+                password=self.password_input.text() if self.current_type == "password" else None,
+                email=self.email_input.text().strip() or None,
+                total=self.total_spin.value() if self.current_type == "serial" else None,
+                used=self.used_spin.value() if self.current_type == "serial" else None,
+                remain=self.remain_spin.value() if self.current_type == "serial" else None,
+                expire=expire_str or None,
+                url=self.url_input.text().strip() or None if self.current_type == "password" else None,
+                status=kept_status,
+                note=self.note_input.toPlainText().strip() or None,
+                updated=format_now(),
+                tags=self.tags_input.text().strip() or None,
+            )
+        else:
+            # 模板引擎类型：收集动态字段 -> extra，核心列自动镜像
+            extra = {}
+            for key, (fdef, widget) in self.dynamic_widgets.items():
+                val = self._field_value(fdef, widget)
+                if fdef.get("required") and not val:
+                    QMessageBox.warning(self, "提示", f"{fdef['label']} 不能为空")
+                    return
+                if val:
+                    extra[key] = val
+            asset = Asset(
+                id=self.asset.id if self.asset else 0,
+                asset_type=self.current_type,
+                name=self.name_input.text().strip(),
+                account=resolve_column(tpl, extra, "account") or "-",
+                password=None,
+                email=None,
+                total=None, used=None, remain=None,
+                expire=resolve_column(tpl, extra, "expire") or None,
+                url=None,
+                status=kept_status,
+                note=self.note_input.toPlainText().strip() or None,
+                updated=format_now(),
+                extra=extra or None,
+                tags=self.tags_input.text().strip() or None,
+            )
+        asset.status = calculate_status(asset, expire_days=tpl.get("expire_days"))
         self.saved.emit(asset)
         self.accept()
 
@@ -427,9 +673,10 @@ class RecycleBinDialog(QDialog):
     restored_all = pyqtSignal()
     cleared = pyqtSignal()
 
-    def __init__(self, parent=None, recycle_bin=None):
+    def __init__(self, parent=None, recycle_bin=None, custom_templates=None):
         super().__init__(parent)
         self.recycle_bin = recycle_bin or []
+        self.custom_templates = custom_templates or []
         self.setWindowTitle("回收站")
         self.setMinimumSize(700, 500)
         self.setup_ui()
@@ -487,11 +734,6 @@ class RecycleBinDialog(QDialog):
             clear_btn.clicked.connect(self.on_clear_all)
             hlayout.addWidget(clear_btn)
 
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("modalCloseBtn")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.clicked.connect(self.reject)
-        hlayout.addWidget(close_btn)
         layout.addWidget(header)
 
         # 表格
@@ -525,7 +767,7 @@ class RecycleBinDialog(QDialog):
 
             for i, asset in enumerate(self.recycle_bin):
                 self.table.setItem(i, 0, QTableWidgetItem(asset.name))
-                tc = TYPE_CONFIG[asset.asset_type]
+                tc = get_type_config(asset.asset_type, self.custom_templates)
                 type_item = QTableWidgetItem(f"{tc['icon']} {tc['label']}")
                 self.table.setItem(i, 1, type_item)
                 self.table.setItem(i, 2, QTableWidgetItem(asset.account))  # 默认明文显示
@@ -713,11 +955,6 @@ class ChangeMasterPasswordDialog(QDialog):
         title.setObjectName("modalTitle")
         hlayout.addWidget(title)
         hlayout.addStretch()
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("modalCloseBtn")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.clicked.connect(self.reject)
-        hlayout.addWidget(close_btn)
         layout.addWidget(header)
 
         # 主体
@@ -793,3 +1030,222 @@ class ChangeMasterPasswordDialog(QDialog):
             return
         self.submitted.emit(old_pw, new_pw)
         self.accept()
+
+
+class TemplateManagerDialog(QDialog):
+    """设置 - 资产模板管理：查看内置模板，创建/删除自定义模板"""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None, db=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("资产模板管理")
+        self.setMinimumSize(640, 560)
+        self.setup_ui()
+
+    def setup_ui(self):
+        from ui.style import MAIN_STYLE
+        self.setStyleSheet(MAIN_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 头部
+        header = QWidget()
+        header.setObjectName("modalHeader")
+        hlayout = QHBoxLayout(header)
+        hlayout.setContentsMargins(20, 16, 20, 16)
+        title = QLabel("🧩 资产模板管理")
+        title.setObjectName("modalTitle")
+        hlayout.addWidget(title)
+        hlayout.addStretch()
+        layout.addWidget(header)
+
+        body = QWidget()
+        body.setObjectName("modalBody")
+        blayout = QVBoxLayout(body)
+        blayout.setContentsMargins(24, 20, 24, 20)
+        blayout.setSpacing(14)
+
+        # ---- 内置模板 ----
+        blayout.addWidget(self._form_label("内置模板（预置专属字段，不可删除）"))
+        from templates import BUILTIN_ORDER, BUILTIN_TEMPLATES
+        builtin_text = "    ".join(
+            f"{BUILTIN_TEMPLATES[k]['icon']} {BUILTIN_TEMPLATES[k]['label']}"
+            for k in BUILTIN_ORDER
+        )
+        builtin_label = QLabel(builtin_text)
+        builtin_label.setStyleSheet("font-size: 13px; color: #475569; padding: 4px 0;")
+        builtin_label.setWordWrap(True)
+        blayout.addWidget(builtin_label)
+
+        # ---- 自定义模板列表 ----
+        blayout.addWidget(self._form_label("自定义模板"))
+        self.custom_list = QTableWidget()
+        self.custom_list.setColumnCount(4)
+        self.custom_list.setHorizontalHeaderLabels(["名称", "字段数", "到期提醒", "操作"])
+        self.custom_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.custom_list.verticalHeader().setVisible(False)
+        self.custom_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.custom_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.custom_list.setMaximumHeight(130)
+        blayout.addWidget(self.custom_list)
+        self.refresh_custom_list()
+
+        # ---- 新建自定义模板 ----
+        blayout.addWidget(self._form_label("新建自定义模板"))
+        name_row = QHBoxLayout()
+        name_row.setSpacing(10)
+        self.tpl_name = QLineEdit()
+        self.tpl_name.setObjectName("inputField")
+        self.tpl_name.setPlaceholderText("模板名称，如: 游戏账号")
+        name_row.addWidget(self.tpl_name, 2)
+        name_row.addWidget(QLabel("到期提醒:"))
+        self.tpl_expire_days = QSpinBox()
+        self.tpl_expire_days.setObjectName("inputField")
+        self.tpl_expire_days.setRange(0, 365)
+        self.tpl_expire_days.setValue(30)
+        self.tpl_expire_days.setSpecialValueText("不提醒")
+        self.tpl_expire_days.setSuffix(" 天")
+        name_row.addWidget(self.tpl_expire_days)
+        blayout.addLayout(name_row)
+
+        # 字段表
+        self.fields_table = QTableWidget()
+        self.fields_table.setColumnCount(4)
+        self.fields_table.setHorizontalHeaderLabels(["字段名称", "字段类型", "选项(下拉用,逗号分隔)", "必填"])
+        self.fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.fields_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.fields_table.verticalHeader().setVisible(False)
+        blayout.addWidget(self.fields_table)
+
+        field_btns = QHBoxLayout()
+        add_field_btn = QPushButton("➕ 添加字段")
+        add_field_btn.setObjectName("btnSecondary")
+        add_field_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_field_btn.clicked.connect(self.add_field_row)
+        field_btns.addWidget(add_field_btn)
+        del_field_btn = QPushButton("➖ 删除选中字段")
+        del_field_btn.setObjectName("btnSecondary")
+        del_field_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_field_btn.clicked.connect(self.remove_field_row)
+        field_btns.addWidget(del_field_btn)
+        field_btns.addStretch()
+        blayout.addLayout(field_btns)
+        self.add_field_row()  # 默认一行
+
+        # 底部
+        footer = QWidget()
+        footer.setObjectName("modalFooter")
+        flayout = QHBoxLayout(footer)
+        flayout.setContentsMargins(24, 0, 24, 20)
+        flayout.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.setObjectName("btnSecondary")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        flayout.addWidget(close_btn)
+        save_btn = QPushButton("💾 保存模板")
+        save_btn.setObjectName("btnPrimary")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.clicked.connect(self.save_template)
+        flayout.addWidget(save_btn)
+        layout.addWidget(body)
+        layout.addWidget(footer)
+
+    def _form_label(self, text):
+        label = QLabel(text)
+        label.setObjectName("formLabel")
+        return label
+
+    def refresh_custom_list(self):
+        templates = self.db.get_custom_templates() if self.db else []
+        self.custom_list.setRowCount(len(templates))
+        for i, tpl in enumerate(templates):
+            self.custom_list.setItem(i, 0, QTableWidgetItem(f"{tpl.get('icon', '🧩')} {tpl.get('label', '')}"))
+            self.custom_list.setItem(i, 1, QTableWidgetItem(str(len(tpl.get("fields", [])))))
+            days = tpl.get("expire_days")
+            self.custom_list.setItem(i, 2, QTableWidgetItem(f"前 {days} 天" if days else "不提醒"))
+            del_btn = QPushButton("🗑️ 删除")
+            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            del_btn.setStyleSheet("color: #ef4444; border: none; background: transparent; font-size: 12px;")
+            del_btn.clicked.connect(lambda checked, k=tpl["key"]: self.delete_template(k))
+            self.custom_list.setCellWidget(i, 3, del_btn)
+        if not templates:
+            self.custom_list.setRowCount(1)
+            empty = QTableWidgetItem("暂无自定义模板")
+            empty.setForeground(QColor("#94a3b8"))
+            self.custom_list.setItem(0, 0, empty)
+
+    def add_field_row(self):
+        row = self.fields_table.rowCount()
+        self.fields_table.insertRow(row)
+        self.fields_table.setItem(row, 0, QTableWidgetItem(""))
+        combo = QComboBox()
+        for ftype, flabel in FIELD_TYPE_LABELS.items():
+            combo.addItem(flabel, ftype)
+        self.fields_table.setCellWidget(row, 1, combo)
+        self.fields_table.setItem(row, 2, QTableWidgetItem(""))
+        chk = QCheckBox()
+        chk_widget = QWidget()
+        chk_layout = QHBoxLayout(chk_widget)
+        chk_layout.setContentsMargins(0, 0, 0, 0)
+        chk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        chk_layout.addWidget(chk)
+        self.fields_table.setCellWidget(row, 3, chk_widget)
+
+    def remove_field_row(self):
+        row = self.fields_table.currentRow()
+        if row >= 0:
+            self.fields_table.removeRow(row)
+
+    def save_template(self):
+        name = self.tpl_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "提示", "请输入模板名称")
+            return
+        fields = []
+        for row in range(self.fields_table.rowCount()):
+            fname_item = self.fields_table.item(row, 0)
+            fname = fname_item.text().strip() if fname_item else ""
+            if not fname:
+                continue
+            combo = self.fields_table.cellWidget(row, 1)
+            ftype = combo.currentData()
+            opts_item = self.fields_table.item(row, 2)
+            opts = [o.strip() for o in (opts_item.text() if opts_item else "").split(",") if o.strip()]
+            chk_widget = self.fields_table.cellWidget(row, 3)
+            chk = chk_widget.findChild(QCheckBox)
+            required = chk.isChecked() if chk else False
+            if ftype == FIELD_SELECT and not opts:
+                QMessageBox.warning(self, "提示", f"字段「{fname}」是下拉选项类型，请填写选项")
+                return
+            fields.append({
+                "key": f"f{len(fields) + 1}",
+                "label": fname,
+                "type": ftype,
+                "required": required,
+                "options": opts,
+                "placeholder": "",
+            })
+        if not fields:
+            QMessageBox.warning(self, "提示", "请至少添加一个字段")
+            return
+        days = self.tpl_expire_days.value()
+        from templates import make_custom_template
+        tpl = make_custom_template(name, fields, expire_days=days if days > 0 else None)
+        self.db.add_custom_template(tpl)
+        QMessageBox.information(self, "成功", f"模板「{name}」已创建")
+        self.tpl_name.clear()
+        self.fields_table.setRowCount(0)
+        self.add_field_row()
+        self.refresh_custom_list()
+        self.changed.emit()
+
+    def delete_template(self, key):
+        ret = QMessageBox.question(self, "确认", "删除该自定义模板？已有资产数据不受影响")
+        if ret == QMessageBox.StandardButton.Yes:
+            self.db.delete_custom_template(key)
+            self.refresh_custom_list()
+            self.changed.emit()

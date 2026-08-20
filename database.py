@@ -65,6 +65,13 @@ class Database:
                     deleted_at TEXT NOT NULL
                 )
             """)
+            # 迁移：为模板引擎扩展字段补充 extra 列、高级筛选补充 tags 列（旧库自动升级）
+            for table in ("assets", "recycle_bin"):
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                if "extra" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN extra TEXT")
+                if "tags" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN tags TEXT")
             conn.commit()
 
     def is_initialized(self) -> bool:
@@ -130,16 +137,18 @@ class Database:
         new_crypto = VaultCrypto(new_password)
         with sqlite3.connect(self.db_path) as conn:
             for table in ("assets", "recycle_bin"):
-                cur = conn.execute(f"SELECT id, account, password FROM {table}")
+                cur = conn.execute(f"SELECT id, account, password, extra FROM {table}")
                 rows = cur.fetchall()
-                for rid, enc_acc, enc_pw in rows:
+                for rid, enc_acc, enc_pw, enc_extra in rows:
                     dec_acc = self._decrypt(enc_acc)
                     dec_pw = self._decrypt(enc_pw) if enc_pw else None
+                    dec_extra = self._decrypt(enc_extra) if enc_extra else None
                     conn.execute(
-                        f"UPDATE {table} SET account = ?, password = ? WHERE id = ?",
+                        f"UPDATE {table} SET account = ?, password = ?, extra = ? WHERE id = ?",
                         (
                             new_crypto.encrypt(dec_acc),
                             new_crypto.encrypt(dec_pw) if dec_pw else None,
+                            new_crypto.encrypt(dec_extra) if dec_extra else None,
                             rid,
                         ),
                     )
@@ -165,6 +174,25 @@ class Database:
             return text or ""
         return self.crypto.decrypt(text)
 
+    def _encrypt_extra(self, extra) -> Optional[str]:
+        """扩展字段整体加密为 JSON 密文"""
+        if not extra:
+            return None
+        return self._encrypt(json.dumps(extra, ensure_ascii=False))
+
+    def _decrypt_extra(self, text) -> Optional[dict]:
+        """解密扩展字段；无内容或解密失败返回 None"""
+        if not text:
+            return None
+        try:
+            return json.loads(self._decrypt(text))
+        except Exception:
+            return None
+
+    # SELECT 列清单（含扩展字段 extra 与标签 tags）
+    _COLS = "id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags"
+    _COLS_DELETED = _COLS + ", deleted_at"
+
     def _row_to_asset(self, row, include_deleted=False) -> Asset:
         kwargs = {
             "id": row[0],
@@ -181,16 +209,22 @@ class Database:
             "status": row[11],
             "note": row[12],
             "updated": row[13],
+            "extra": self._decrypt_extra(row[14]) if len(row) > 14 else None,
+            "tags": row[15] if len(row) > 15 else None,
         }
         if include_deleted:
-            kwargs["deleted_at"] = row[14] if len(row) > 14 else None
-        return Asset(**kwargs)
+            kwargs["deleted_at"] = row[16] if len(row) > 16 else None
+        asset = Asset(**kwargs)
+        # 生命周期状态实时重算：旧版 tight/expiring 状态自动迁移，
+        # 过期判断保持最新；archived 为手动归档，calculate_status 会保留
+        asset.status = calculate_status(asset)
+        return asset
 
     def add_asset(self, asset: Asset) -> int:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute("""
-                INSERT INTO assets (asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO assets (asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 asset.asset_type,
                 asset.name,
@@ -205,6 +239,8 @@ class Database:
                 asset.status,
                 asset.note,
                 asset.updated,
+                self._encrypt_extra(asset.extra),
+                asset.tags,
             ))
             conn.commit()
             return cur.lastrowid
@@ -215,7 +251,7 @@ class Database:
                 UPDATE assets SET
                     asset_type = ?, name = ?, account = ?, password = ?,
                     email = ?, total = ?, used = ?, remain = ?,
-                    expire = ?, url = ?, status = ?, note = ?, updated = ?
+                    expire = ?, url = ?, status = ?, note = ?, updated = ?, extra = ?, tags = ?
                 WHERE id = ?
             """, (
                 asset.asset_type,
@@ -231,14 +267,16 @@ class Database:
                 asset.status,
                 asset.note,
                 asset.updated,
+                self._encrypt_extra(asset.extra),
+                asset.tags,
                 asset.id,
             ))
             conn.commit()
 
     def get_assets(self) -> List[Asset]:
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("""
-                SELECT id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated
+            cur = conn.execute(f"""
+                SELECT {self._COLS}
                 FROM assets ORDER BY updated DESC
             """)
             return [self._row_to_asset(row) for row in cur.fetchall()]
@@ -249,23 +287,23 @@ class Database:
             return
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
-                INSERT INTO recycle_bin (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, deleted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO recycle_bin (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 asset.id, asset.asset_type, asset.name,
                 self._encrypt(asset.account),
                 self._encrypt(asset.password) if asset.password else None,
                 asset.email, asset.total, asset.used, asset.remain,
                 asset.expire, asset.url, asset.status, asset.note,
-                asset.updated, format_now(),
+                asset.updated, self._encrypt_extra(asset.extra), asset.tags, format_now(),
             ))
             conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
             conn.commit()
 
     def get_asset_by_id(self, asset_id: int) -> Optional[Asset]:
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("""
-                SELECT id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated
+            cur = conn.execute(f"""
+                SELECT {self._COLS}
                 FROM assets WHERE id = ?
             """, (asset_id,))
             row = cur.fetchone()
@@ -273,24 +311,24 @@ class Database:
 
     def get_recycle_bin(self) -> List[Asset]:
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("""
-                SELECT id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, deleted_at
+            cur = conn.execute(f"""
+                SELECT {self._COLS_DELETED}
                 FROM recycle_bin ORDER BY deleted_at DESC
             """)
             return [self._row_to_asset(row, include_deleted=True) for row in cur.fetchall()]
 
     def restore_asset(self, asset_id: int):
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("""
-                SELECT id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated
+            cur = conn.execute(f"""
+                SELECT {self._COLS}
                 FROM recycle_bin WHERE id = ?
             """, (asset_id,))
             row = cur.fetchone()
             if not row:
                 return
             conn.execute("""
-                INSERT INTO assets (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO assets (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, row)
             conn.execute("DELETE FROM recycle_bin WHERE id = ?", (asset_id,))
             conn.commit()
@@ -309,15 +347,15 @@ class Database:
     def restore_all(self):
         """全部恢复：将回收站所有记录移回 assets 表"""
         with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("""
-                SELECT id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated
+            cur = conn.execute(f"""
+                SELECT {self._COLS}
                 FROM recycle_bin
             """)
             rows = cur.fetchall()
             for row in rows:
                 conn.execute("""
-                    INSERT OR REPLACE INTO assets (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO assets (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, row)
             conn.execute("DELETE FROM recycle_bin")
             conn.commit()
@@ -330,16 +368,47 @@ class Database:
         stats = Stats()
         stats.total = len(assets)
         stats.normal = sum(1 for a in assets if a.status == "normal")
-        stats.tight = sum(1 for a in assets if a.status == "tight")
         stats.empty = sum(1 for a in assets if a.status == "empty")
-        stats.expiring = sum(1 for a in assets if a.status == "expiring")
+        stats.expired = sum(1 for a in assets if a.status == "expired")
+        stats.archived = sum(1 for a in assets if a.status == "archived")
         stats.serial_count = len(serials)
         stats.remain = sum(a.remain or 0 for a in serials)
-        stats.serial_expiring = sum(1 for a in serials if a.status == "expiring")
         stats.pw_count = len(passwords)
         stats.weak_pw = sum(1 for a in passwords if a.password and is_weak_password(a.password))
         stats.pw_with_url = sum(1 for a in passwords if a.url)
         return stats
+
+    # ===== 自定义资产模板（存于 vault_meta，结构不加密） =====
+
+    def get_custom_templates(self) -> List[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "SELECT value FROM vault_meta WHERE key = 'custom_templates'"
+            )
+            row = cur.fetchone()
+        if not row:
+            return []
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return []
+
+    def _save_custom_templates(self, templates: List[dict]):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",
+                ("custom_templates", json.dumps(templates, ensure_ascii=False)),
+            )
+            conn.commit()
+
+    def add_custom_template(self, template: dict):
+        templates = self.get_custom_templates()
+        templates.append(template)
+        self._save_custom_templates(templates)
+
+    def delete_custom_template(self, key: str):
+        templates = [t for t in self.get_custom_templates() if t.get("key") != key]
+        self._save_custom_templates(templates)
 
     def export_data(self) -> str:
         assets = self.get_assets()
@@ -358,26 +427,28 @@ class Database:
             for a in data.get("assets", []):
                 asset = Asset.from_dict(a)
                 conn.execute("""
-                    INSERT INTO assets (asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO assets (asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     asset.asset_type, asset.name,
                     self._encrypt(asset.account),
                     self._encrypt(asset.password) if asset.password else None,
                     asset.email, asset.total, asset.used, asset.remain,
                     asset.expire, asset.url, asset.status, asset.note, asset.updated,
+                    self._encrypt_extra(asset.extra), asset.tags,
                 ))
             for a in data.get("recycle_bin", []):
                 asset = Asset.from_dict(a)
                 conn.execute("""
-                    INSERT INTO recycle_bin (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, deleted_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO recycle_bin (id, asset_type, name, account, password, email, total, used, remain, expire, url, status, note, updated, extra, tags, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     asset.id, asset.asset_type, asset.name,
                     self._encrypt(asset.account),
                     self._encrypt(asset.password) if asset.password else None,
                     asset.email, asset.total, asset.used, asset.remain,
                     asset.expire, asset.url, asset.status, asset.note,
-                    asset.updated, asset.deleted_at or format_now(),
+                    asset.updated, self._encrypt_extra(asset.extra), asset.tags,
+                    asset.deleted_at or format_now(),
                 ))
             conn.commit()
